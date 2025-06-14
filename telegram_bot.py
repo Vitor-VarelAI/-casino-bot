@@ -3,9 +3,10 @@ import os
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 import random
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext, CallbackQueryHandler, ConversationHandler
 
 from engine import MartingaleEngine, SessionState
+from bacbo_handler import bacbo_start, bacbo_choose_bet, bacbo_exit, CHOOSE_BET
 
 # Enable logging
 logging.basicConfig(
@@ -23,24 +24,36 @@ if not TELEGRAM_BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not found in environment variables! Please set it in your .env file.")
     exit()
 
+# --- Keyboards ---
+def get_start_menu_keyboard() -> InlineKeyboardMarkup:
+    """Creates the main menu keyboard."""
+    keyboard = [
+        [InlineKeyboardButton("📈 Martingale Advisor", callback_data="menu_martingale")],
+        [InlineKeyboardButton("🎲 Bac Bo", callback_data="menu_bacbo")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_game_keyboard() -> InlineKeyboardMarkup:
+    """Creates the 'I Won'/'I Lost' keyboard."""
+    keyboard = [
+        [
+            InlineKeyboardButton("I Won ✅", callback_data='won'),
+            InlineKeyboardButton("I Lost ❌", callback_data='lost')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message and instructions when the /start command is issued."""
+    """Sends a welcome message with a game selection menu."""
     user = update.effective_user
     await update.message.reply_html(
-        rf"""Hi {user.mention_html()}! Welcome to the Martingale Bot.
-
-To start a game, use the <b>/play</b> command.
-
-You can optionally set your starting bankroll and base bet like this:
-<code>/play [bankroll] [base_bet]</code>
-
-<b>Example:</b> <code>/play 200 5</code> (starts with a 200 bankroll and a 5 base bet).
-
-If you just use <code>/play</code>, it will start with defaults (100 bankroll, 1 base bet).
-
-Use <b>/stop</b> to end your current game at any time.""",
+        rf"Hi {user.mention_html()}! Welcome to GaleBot. Please choose a game:",
+        reply_markup=get_start_menu_keyboard(),
     )
+
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Echo the user message."""
@@ -129,45 +142,72 @@ async def play_command(update: Update, context: CallbackContext) -> None:
 
 
 async def button_handler(update: Update, context: CallbackContext) -> None:
-    """Handles button presses for win/loss reporting."""
+    """Parses the CallbackQuery and updates the message text."""
     query = update.callback_query
-    await query.answer() # Acknowledge the button press
+    await query.answer()  # Acknowledge the button press
 
-    user = query.from_user
+    # Handle menu selections first
+    if query.data == "menu_martingale":
+        martingale_instructions = (
+            "<b>Martingale Advisor</b>\n\n"
+            "To start a game, use the <code>/play</code> command.\n\n"
+            "You can optionally set your starting bankroll and base bet:\n"
+            "<code>/play [bankroll] [base_bet]</code>\n\n"
+            "<b>Example:</b> <code>/play 200 5</code>\n\n"
+            "Use <code>/stop</code> to end your game."
+        )
+        await query.edit_message_text(text=martingale_instructions, parse_mode='HTML')
+        return
+
+    if query.data == "menu_bacbo":
+        await query.edit_message_text(
+            text="🎲 You've selected <b>Bac Bo</b>!\n\nUse the /bacbo command to start playing.",
+            parse_mode='HTML'
+        )
+        return
+
+    # --- Handle 'won'/'lost' for the Martingale game ---
+    user = update.effective_user
     if 'engine' not in context.user_data:
-        await query.edit_message_text(text="Your game session has expired or was stopped. Use /play to start a new one.")
+        await query.edit_message_text(text="Your game session has expired or was stopped. Please start a new game with /play.")
         return
 
     engine: MartingaleEngine = context.user_data['engine']
-    state: SessionState = engine.s
-
-    # Determine if the user won or lost from the button press
     won = query.data == 'won'
-    outcome_text = "WON" if won else "LOST"
-    bet_amount = engine.next_bet()
 
     try:
+        last_bet = engine.s.current_bet
         engine.record_result(won)
+        state = engine.s
+
+        # Check for game over conditions after the result is recorded
+        if state.bankroll <= 0:
+            await query.edit_message_text(text=f"Last Round: You {'WON' if won else 'LOST'} a bet of {last_bet:.2f}.\n\nGame over! Your bankroll is depleted. Use /stop to clear.")
+            del context.user_data['engine']
+            return
+        
+        if engine.next_bet() > state.bankroll:
+             await query.edit_message_text(text=f"Last Round: You {'WON' if won else 'LOST'} a bet of {last_bet:.2f}.\n\nGame over! Your next bet is larger than your bankroll. Use /stop to clear.")
+             del context.user_data['engine']
+             return
+
+        outcome_text = "WON" if won else "LOST"
+        message = (
+            f"Last Round: You {outcome_text} a bet of {last_bet:.2f}.\n"
+            f"New Bankroll: {state.bankroll:.2f} | Loss Streak: {state.loss_streak}\n\n"
+            f"Your next bet is: {engine.next_bet():.2f}\n\n"
+            f"Place the bet and report the result below."
+        )
+        await query.edit_message_text(text=message, reply_markup=get_game_keyboard())
+
     except RuntimeError as e:
-        await query.edit_message_text(text=f"🛑 STOP-LOSS HIT! {e}\nGame over. Use /play to start a new one.")
+        # This catches the stop-loss from the engine
+        await query.edit_message_text(text=f"🛑 Stop-Loss Triggered! 🛑\n{e}\n\nYour session has been stopped.")
         del context.user_data['engine']
-        return
-
-    # Check for game over after the result is recorded
-    if state.bankroll <= 0:
-        await query.edit_message_text(text=f"You {outcome_text} the last round of {bet_amount:.2f}.\nYour bankroll is now empty. Game over!\nUse /play to start a new one.")
-        del context.user_data['engine']
-        return
-
-    next_bet_amount = engine.next_bet()
-    message = (
-        f"Last Round: You {outcome_text} a bet of {bet_amount:.2f}.\n"
-        f"New Bankroll: {state.bankroll:.2f} | Loss Streak: {state.loss_streak}\n\n"
-        f"Your next bet is: {next_bet_amount:.2f}\n\n"
-        f"Place the bet and report the result below."
-    )
-
-    await query.edit_message_text(text=message, reply_markup=get_game_keyboard())
+        logger.info(f"Game session stopped for user {user.id}.")
+        await update.message.reply_text("Your game session has been stopped and all progress cleared.")
+    else:
+        await update.message.reply_text("You don't have an active game session to stop.")
 
 
 async def stop_command(update: Update, context: CallbackContext) -> None:
@@ -198,7 +238,25 @@ def main() -> None:
     # on non-command i.e message - echo the message on Telegram
     application.add_handler(CommandHandler("play", play_command))
     application.add_handler(CommandHandler("stop", stop_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
+
+    # --- Bac Bo Conversation Handler ---
+    bacbo_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('bacbo', bacbo_start)],
+        states={
+            CHOOSE_BET: [
+                CallbackQueryHandler(bacbo_choose_bet, pattern='^bacbo_(player|banker)$'),
+            ],
+        },
+        fallbacks=[
+            CallbackQueryHandler(bacbo_exit, pattern='^bacbo_exit$'),
+            CommandHandler('stop', bacbo_exit) # Also allow /stop to exit
+        ],
+    )
+    application.add_handler(bacbo_conv_handler)
+
+    # Add the main button handler with a specific pattern to avoid conflicts
+    # This should come AFTER specific handlers like the one for Bac Bo
+    application.add_handler(CallbackQueryHandler(button_handler, pattern='^(menu_martingale|menu_bacbo|won|lost)$'))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     
     # Add error handler
